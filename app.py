@@ -321,25 +321,20 @@ MOVEMENT_FUNCS = {
 
 
 # ============================================================================
+# ============================================================================
 # 6. MODUL EMBEDDING / EXTRACTION (Tahap 4 - Modified LSB)
 # ============================================================================
 def bytes_to_bits(data: bytes) -> str:
     return "".join(f"{byte:08b}" for byte in data)
 
-
 def bits_to_bytes(bits: str) -> bytes:
     n = len(bits) // 8
     return bytes(int(bits[i * 8:(i + 1) * 8], 2) for i in range(n))
 
-
 def build_routing_context(password: str, h: int, w: int):
-    """
-    Membangun 3 stream LCG + memilih pola pergerakan (sekali di awal,
-    diambil dari draw pertama stream movement) sesuai aturan Triple-A.
-    """
-    lcg_move = derive_lcg_seeds(password, "MOVE", m=4)     # 0-3
-    lcg_chan = derive_lcg_seeds(password, "CHAN", m=7)     # 0-6
-    lcg_bit = derive_lcg_seeds(password, "BIT", m=4)       # akan diatur 1-3
+    lcg_move = derive_lcg_seeds(password, "MOVE", m=4)
+    lcg_chan = derive_lcg_seeds(password, "CHAN", m=7)
+    lcg_bit = derive_lcg_seeds(password, "BIT", m=4)
 
     move_choice = lcg_move.next() % 4
     move_name, move_func = MOVEMENT_FUNCS[move_choice]
@@ -347,28 +342,22 @@ def build_routing_context(password: str, h: int, w: int):
 
     return move_name, pixel_order, lcg_chan, lcg_bit
 
-
 def next_bit_count(lcg_bit: LCG) -> int:
-    """Jumlah bit sisip wajib 1-3 (bukan 0), mengikuti aturan slide C/a != 0."""
     val = lcg_bit.next() % 4
     if val == 0:
         val = 1
     return val
 
-
-def embed_message(cover_img: np.ndarray, secret_bits: str, password: str):
-    """
-    Menyisipkan `secret_bits` (string biner) ke dalam array citra `cover_img`
-    (H x W x 3, uint8) menggunakan rute LCG Triple-A.
-    Mengembalikan: stego_img (np.ndarray), movement_name (str), used_pixels (int)
-    """
+# ✨ MODIFIKASI: Menambahkan parameter custom_lcg
+def embed_message(cover_img: np.ndarray, secret_bits: str, password: str, mode="Otomatis", manual_chan="RGB", manual_bit=1, custom_lcg=None):
     h, w, _ = cover_img.shape
     stego_img = cover_img.copy()
     move_name, pixel_order, lcg_chan, lcg_bit = build_routing_context(password, h, w)
 
-    total_capacity = 0
-    for (y, x) in pixel_order:
-        pass  # kapasitas dihitung terpisah di fungsi calculate_capacity()
+    # Timpa LCG bawaan jika mode "Input LCG" dipilih
+    if mode == "Input LCG" and custom_lcg:
+        lcg_chan = LCG(a=custom_lcg['c_a'], c=custom_lcg['c_c'], x0=custom_lcg['c_x0'], m=7)
+        lcg_bit = LCG(a=custom_lcg['b_a'], c=custom_lcg['b_c'], x0=custom_lcg['b_x0'], m=4)
 
     bit_idx = 0
     total_bits = len(secret_bits)
@@ -378,9 +367,13 @@ def embed_message(cover_img: np.ndarray, secret_bits: str, password: str):
         if bit_idx >= total_bits:
             break
 
-        channel_choice = lcg_chan.next() % 7
-        channels = CHANNEL_MAP[channel_choice]
-        n_bits = next_bit_count(lcg_bit)  # 1-3 bit per channel terpilih
+        if mode == "Manual Statis":
+            channels = list(manual_chan)
+            n_bits = manual_bit
+        else:
+            channel_choice = lcg_chan.next() % 7
+            channels = CHANNEL_MAP[channel_choice]
+            n_bits = next_bit_count(lcg_bit)
 
         for ch in channels:
             if bit_idx >= total_bits:
@@ -388,19 +381,12 @@ def embed_message(cover_img: np.ndarray, secret_bits: str, password: str):
             c_idx = CHANNEL_IDX[ch]
             pixel_val = int(stego_img[y, x, c_idx])
 
-            # Ambil sebanyak n_bits dari pesan (padding '0' jika sisa < n_bits)
             chunk = secret_bits[bit_idx: bit_idx + n_bits]
             chunk = chunk.ljust(n_bits, "0")
             bit_idx += len(secret_bits[bit_idx: bit_idx + n_bits])
 
-            # ---- OPERASI BITWISE INTI (MODIFIED LSB) ----
-            # 1) Bersihkan n_bits LSB paling kanan dari pixel_val:
-            #    mask = 0xFF << n_bits  (lalu di-AND 0xFF agar tetap 8-bit)
-            #    Contoh n_bits=2 -> mask = 11111100
             mask = (0xFF << n_bits) & 0xFF
             cleared = pixel_val & mask
-
-            # 2) Sisipkan bit pesan (chunk) ke n_bits LSB yang sudah dikosongkan
             new_val = cleared | int(chunk, 2)
 
             stego_img[y, x, c_idx] = np.uint8(new_val)
@@ -409,23 +395,28 @@ def embed_message(cover_img: np.ndarray, secret_bits: str, password: str):
 
     return stego_img, move_name, used_pixels, bit_idx >= total_bits
 
-
-def extract_message(stego_img: np.ndarray, password: str, total_bits_needed: int):
-    """
-    Mengekstrak `total_bits_needed` bit dari stego_img menggunakan rute LCG
-    yang SAMA persis dengan proses embedding (deterministik dari password).
-    """
+# ✨ MODIFIKASI: Menambahkan parameter custom_lcg
+def extract_message(stego_img: np.ndarray, password: str, total_bits_needed: int, mode="Otomatis", manual_chan="RGB", manual_bit=1, custom_lcg=None):
     h, w, _ = stego_img.shape
     move_name, pixel_order, lcg_chan, lcg_bit = build_routing_context(password, h, w)
+
+    # Timpa LCG bawaan jika mode "Input LCG" dipilih
+    if mode == "Input LCG" and custom_lcg:
+        lcg_chan = LCG(a=custom_lcg['c_a'], c=custom_lcg['c_c'], x0=custom_lcg['c_x0'], m=7)
+        lcg_bit = LCG(a=custom_lcg['b_a'], c=custom_lcg['b_c'], x0=custom_lcg['b_x0'], m=4)
 
     extracted_bits = ""
     for (y, x) in pixel_order:
         if len(extracted_bits) >= total_bits_needed:
             break
 
-        channel_choice = lcg_chan.next() % 7
-        channels = CHANNEL_MAP[channel_choice]
-        n_bits = next_bit_count(lcg_bit)
+        if mode == "Manual Statis":
+            channels = list(manual_chan)
+            n_bits = manual_bit
+        else:
+            channel_choice = lcg_chan.next() % 7
+            channels = CHANNEL_MAP[channel_choice]
+            n_bits = next_bit_count(lcg_bit)
 
         for ch in channels:
             if len(extracted_bits) >= total_bits_needed:
@@ -433,8 +424,6 @@ def extract_message(stego_img: np.ndarray, password: str, total_bits_needed: int
             c_idx = CHANNEL_IDX[ch]
             pixel_val = int(stego_img[y, x, c_idx])
 
-            # ---- OPERASI BITWISE INTI (EKSTRAKSI LSB) ----
-            # Ambil n_bits LSB paling kanan: pixel_val & (2^n_bits - 1)
             lsb_mask = (1 << n_bits) - 1
             bits_chunk = pixel_val & lsb_mask
             bits_str = format(bits_chunk, f"0{n_bits}b")
@@ -492,21 +481,21 @@ def compute_channel_metrics(original: np.ndarray, stego: np.ndarray):
     return metrics
 
 
-def build_difference_heatmap(original: np.ndarray, stego: np.ndarray):
-    """
-    Membuat peta perbedaan (difference map) antara citra asli dan stego.
-    Nilai piksel pada heatmap = total selisih absolut R+G+B pada lokasi
-    tersebut, sehingga titik yang disisipi pesan akan tampak menyala.
-    """
-    diff = np.abs(original.astype(np.int16) - stego.astype(np.int16))
-    diff_sum = diff.sum(axis=2)  # gabungkan R,G,B jadi 1 channel intensitas
+# def build_difference_heatmap(original: np.ndarray, stego: np.ndarray):
+#     """
+#     Membuat peta perbedaan (difference map) antara citra asli dan stego.
+#     Nilai piksel pada heatmap = total selisih absolut R+G+B pada lokasi
+#     tersebut, sehingga titik yang disisipi pesan akan tampak menyala.
+#     """
+#     diff = np.abs(original.astype(np.int16) - stego.astype(np.int16))
+#     diff_sum = diff.sum(axis=2)  # gabungkan R,G,B jadi 1 channel intensitas
     
-    # ✨ FITUR BARU: Normalisasi agar jejak LCG menyala terang
-    max_diff = diff_sum.max()
-    if max_diff > 0:
-        diff_sum = (diff_sum / max_diff) * 255  # Paksa yang redup jadi terang maksimal
+#     # ✨ FITUR BARU: Normalisasi agar jejak LCG menyala terang
+#     max_diff = diff_sum.max()
+#     if max_diff > 0:
+#         diff_sum = (diff_sum / max_diff) * 255  # Paksa yang redup jadi terang maksimal
         
-    return diff_sum
+#     return diff_sum
 
 
 def plot_histogram_comparison(original: np.ndarray, stego: np.ndarray):
@@ -591,10 +580,10 @@ st.markdown("<p style='text-align: center; color: #cfe6ff;'>Algoritma: <b>AES-25
 # Membuat Top Bar Menu yang elegan
 menu = option_menu(
     menu_title=None,
-    options=["Cara Kerja", "Embedding", "Extraction"], # <--- Tambah "Cara Kerja" di sini
+    options=["How to Use", "Embedding", "Extraction"], # <--- Tambah "How to Use" di sini
     icons=["book", "lock", "unlock"], # <--- Tambah ikon "book" di sini
     menu_icon="cast",
-    default_index=0, # 0 berarti "Cara Kerja" akan terbuka pertama kali saat web dimuat
+    default_index=0, # 0 berarti "How to Use" akan terbuka pertama kali saat web dimuat
     orientation="horizontal",
     styles={
         "container": {"padding": "0!important", "background-color": "#0a1a3a", "border": "1px solid #1f4f8a", "border-radius": "10px", "margin-bottom": "20px"},
@@ -607,10 +596,10 @@ menu = option_menu(
 st.info("💡 Password yang sama WAJIB digunakan saat Embedding & Extraction.")
 
 # ============================================================================
-# 9.5 HALAMAN CARA KERJA (DOKUMENTASI)
+# 9.5 HALAMAN How to Use (DOKUMENTASI)
 # ============================================================================
-if menu == "Cara Kerja":
-    st.title("📖 Cara Kerja Algoritma Triple-A")
+if menu == "How to Use":
+    st.title("📖 How to Use Algoritma Triple-A")
     st.markdown(
         "Aplikasi ini mengamankan pesan rahasia menggunakan tiga lapis algoritma "
         "(Kriptografi, Pseudo-Random Number Generator, dan Steganografi). "
@@ -659,9 +648,9 @@ if menu == "Cara Kerja":
     st.caption("Silakan navigasikan menu di atas ke **Embedding** untuk mulai menyembunyikan pesan, atau **Extraction** untuk membongkar pesan.")
 
 # ============================================================================
-# 9.5 HALAMAN CARA KERJA (DOKUMENTASI)
+# 9.5 HALAMAN How to Use (DOKUMENTASI)
 # ============================================================================
-if menu == "Cara Kerja":
+if menu == "How to Use":
     st.title("📖 Panduan Penggunaan Aplikasi")
     st.markdown(
         "Selamat datang! Aplikasi ini memiliki dua fungsi utama: **Embedding** (untuk menyembunyikan pesan ke dalam gambar) "
@@ -672,7 +661,7 @@ if menu == "Cara Kerja":
     st.markdown("---")
 
     # PANDUAN EMBEDDING
-    st.markdown("### 🔒 1. Cara Kerja Menu EMBEDDING (Menyisipkan Pesan)")
+    st.markdown("### 🔒 1. How to Use Menu EMBEDDING (Menyisipkan Pesan)")
     st.info("Gunakan menu ini jika Anda memiliki pesan rahasia yang ingin disembunyikan ke dalam sebuah gambar.")
     
     col_e1, col_e2 = st.columns([1, 1])
@@ -692,7 +681,7 @@ if menu == "Cara Kerja":
             """
             **Apa yang Terjadi Setelahnya?**
             * Aplikasi akan menyisipkan pesan Anda ke dalam gambar tersebut tanpa mengubah tampilan visual gambar sama sekali.
-            * Anda akan melihat laporan metrik (seperti PSNR dan Heatmap) untuk membuktikan bahwa gambar tidak rusak.
+            * Anda akan melihat laporan metrik (seperti PSNR dan Histogram) untuk membuktikan bahwa gambar tidak rusak.
             * Di bagian paling bawah, klik **"📥 Download Stego Image"** untuk menyimpan gambar yang sudah berisi pesan rahasia ke laptop Anda. Gambar inilah yang siap Anda kirimkan ke teman Anda!
             """
         )
@@ -700,7 +689,7 @@ if menu == "Cara Kerja":
     st.markdown("---")
 
     # PANDUAN EXTRACTION
-    st.markdown("### 🔓 2. Cara Kerja Menu EXTRACTION (Membongkar Pesan)")
+    st.markdown("### 🔓 2. How to Use Menu EXTRACTION (Membongkar Pesan)")
     st.warning("Gunakan menu ini jika Anda menerima gambar rahasia (Stego Image) dari seseorang dan ingin membaca isinya.")
 
     col_x1, col_x2 = st.columns([1, 1])
@@ -730,9 +719,7 @@ if menu == "Cara Kerja":
 # ============================================================================
 # 10. HALAMAN EMBEDDING
 # ============================================================================
-# if menu == "🔒 Embedding":
-#     st.title("🔒 Embedding — Sisipkan Pesan Rahasia")
-elif menu == "Embedding":  # Ubah kondisi if ini saja, sisanya sama persis!
+elif menu == "Embedding":
     st.title("🔒 Embedding — Sisipkan Pesan Rahasia")
     st.caption("Cover Image → AES-256 → LCG Routing → Modified LSB → Stego Image")
 
@@ -760,7 +747,7 @@ elif menu == "Embedding":  # Ubah kondisi if ini saja, sisanya sama persis!
     with col_form:
         st.subheader("2️⃣ Pesan & Kunci Rahasia")
         
-        # ✨ FITUR BARU: Opsi Input Pesan (Ketik Teks ATAU Unggah File)
+        # Fitur Input Pesan (Ketik Teks ATAU Unggah File)
         input_method = st.radio("Pilih Metode Input:", ["📝 Ketik Manual", "📄 Unggah File (.txt)"], horizontal=True)
         
         secret_message = ""
@@ -775,17 +762,75 @@ elif menu == "Embedding":  # Ubah kondisi if ini saja, sisanya sama persis!
             uploaded_secret = st.file_uploader("Unggah dokumen teks rahasia", type=["txt"])
             if uploaded_secret is not None:
                 try:
-                    # Membaca isi file txt menjadi string
                     secret_message = uploaded_secret.read().decode("utf-8")
                     st.success(f"✅ File '{uploaded_secret.name}' berhasil dibaca! ({len(secret_message)} karakter)")
                     with st.expander("👀 Preview Isi File"):
-                        # Tampilkan preview maksimal 500 karakter agar UI tidak berantakan
                         preview_text = secret_message[:500] + ("..." if len(secret_message) > 500 else "")
                         st.text(preview_text)
                 except Exception:
                     st.error("❌ Gagal membaca file. Pastikan file berformat teks murni (.txt).")
 
-        password = st.text_input("Password / Kunci (AES + Seed LCG)", type="password")
+        # ==========================================
+        # BLOK UI PENGATURAN KEAMANAN (EMBEDDING)
+        # ==========================================
+        st.markdown("---")
+        st.markdown("#### ⚙️ Konfigurasi Keamanan & Steganografi")
+        
+        password = st.text_input("Password / Kunci (AES + Seed LCG)", type="password", placeholder="Wajib diisi...")
+
+        st.write("**Metode Penentuan Saluran & Bit:**")
+        mode_param = st.radio(
+            "Metode Parameter:", 
+            ["🔄 Otomatis (Belakang Layar)", "🔢 Parameter LCG (Auto)", "🛠️ Manual Statis (Pilih Sendiri)"], 
+            horizontal=True,
+            label_visibility="collapsed"
+        )
+        
+        manual_channel = "RGB"
+        manual_bit = 1
+        custom_lcg_params = None
+        
+        # JIKA MENGKLIK OPSI 2 (Parameter LCG Auto - Tampilan otomatis terisi dari password)
+        if mode_param == "🔢 Parameter LCG (Auto)":
+            st.markdown("""<div style="background-color: #0c1f3f; padding: 15px; border-radius: 8px; border: 1px dashed #5ad1ff; margin-bottom: 15px;">
+                <b>Parameter LCG Tergenerasi (Auto dari Password)</b><br>
+                <i>Nilai Xn, A, dan C di bawah ini dihitung otomatis secara real-time berdasarkan kunci Anda.</i>
+                """, unsafe_allow_html=True)
+            
+            # Hitung nilai secara otomatis jika password sudah diinput pengguna
+            if password:
+                lcg_chan_demo = derive_lcg_seeds(password, "CHAN", m=7)
+                lcg_bit_demo = derive_lcg_seeds(password, "BIT", m=4)
+                c_x0, c_a, c_c = lcg_chan_demo.state, lcg_chan_demo.a, lcg_chan_demo.c
+                b_x0, b_a, b_c = lcg_bit_demo.state, lcg_bit_demo.a, lcg_bit_demo.c
+            else:
+                c_x0, c_a, c_c = 0, 0, 0
+                b_x0, b_a, b_c = 0, 0, 0
+
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.number_input("Xn (Channel)", value=int(c_x0), disabled=True, key="embed_auto_cx0")
+                st.number_input("Xn (Bit)", value=int(b_x0), disabled=True, key="embed_auto_bx0")
+            with c2:
+                st.number_input("A (Channel)", value=int(c_a), disabled=True, key="embed_auto_ca")
+                st.number_input("A (Bit)", value=int(b_a), disabled=True, key="embed_auto_ba")
+            with c3:
+                st.number_input("C (Channel)", value=int(c_c), disabled=True, key="embed_auto_cc")
+                st.number_input("C (Bit)", value=int(b_c), disabled=True, key="embed_auto_bc")
+            st.markdown("</div>", unsafe_allow_html=True)
+            
+            custom_lcg_params = {"c_x0": c_x0, "c_a": c_a, "c_c": c_c, "b_x0": b_x0, "b_a": b_a, "b_c": b_c}
+
+        # JIKA MENGKLIK OPSI 3 (Pilih Tombol Manual)
+        elif mode_param == "🛠️ Manual Statis (Pilih Sendiri)":
+            st.markdown("""<div style="background-color: #0c1f3f; padding: 15px; border-radius: 8px; border: 1px dashed #5ad1ff; margin-bottom: 15px;">""", unsafe_allow_html=True)
+            mc1, mc2 = st.columns([1.5, 1])
+            with mc1:
+                manual_channel = st.radio("Saluran Warna:", ["R", "G", "B", "RG", "RB", "GB", "RGB"], horizontal=True)
+            with mc2:
+                manual_bit = st.radio("Depth:", [1, 2, 3], format_func=lambda x: f"{x} Bit", horizontal=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+        # ==========================================
 
         # ---- Real-time capacity counter ----
         if cover_array is not None:
@@ -830,8 +875,20 @@ elif menu == "Embedding":  # Ubah kondisi if ini saja, sisanya sama persis!
                 header_bits = format(len(cipher_bits), f"0{HEADER_BITS}b")
                 full_bits = header_bits + cipher_bits
 
+                # Pemetaan string mode ke fungsi inti steganografi
+                if mode_param == "🔄 Otomatis (Belakang Layar)":
+                    embed_mode = "Otomatis"
+                elif mode_param == "🔢 Parameter LCG (Auto)":
+                    embed_mode = "Input LCG"
+                else:
+                    embed_mode = "Manual Statis"
+
                 stego_array, move_name, used_pixels, fully_embedded = embed_message(
-                    cover_array, full_bits, password
+                    cover_array, full_bits, password, 
+                    mode=embed_mode, 
+                    manual_chan=manual_channel, 
+                    manual_bit=manual_bit,
+                    custom_lcg=custom_lcg_params
                 )
 
             if not fully_embedded:
@@ -842,24 +899,23 @@ elif menu == "Embedding":  # Ubah kondisi if ini saja, sisanya sama persis!
                 )
             else:
                 mse, psnr = compute_mse_psnr(cover_array, stego_array)
-                diff_map = build_difference_heatmap(cover_array, stego_array)
-
+                # diff_map = build_difference_heatmap(cover_array, stego_array)
                 channel_metrics = compute_channel_metrics(cover_array, stego_array)
 
                 st.success(f"✅ Penyisipan berhasil! Pola pergerakan terpilih: **{move_name}**")
 
-                st.markdown("### 📊 Metrics Dashboard")
+                st.markdown("### 📊 Live Metrics Dashboard")
                 m1, m2, m3, m4 = st.columns(4)
-                m1.metric("MSE (Keseluruhan)", f"{mse:.4f}")
+                m1.metric("MSE (Keseluruhan)", f"{mse:.6f}")
                 m2.metric("PSNR (Keseluruhan)", f"{psnr:.2f} dB")
                 m3.metric("Pola Pergerakan", move_name)
                 m4.metric("Piksel Terpakai", f"{used_pixels}")
 
                 st.markdown("#### Detail Metrik Per-Saluran Warna")
                 col_r, col_g, col_b = st.columns(3)
-                col_r.info(f"🔴 **RED** |  MSE: {channel_metrics['Red']['mse']:.4f}  |  PSNR: {channel_metrics['Red']['psnr']:.2f} dB")
-                col_g.success(f"🟢 **GREEN**|  MSE: {channel_metrics['Green']['mse']:.4f}  |  PSNR: {channel_metrics['Green']['psnr']:.2f} dB")
-                col_b.info(f"🔵 **BLUE** |  MSE: {channel_metrics['Blue']['mse']:.4f}  |  PSNR: {channel_metrics['Blue']['psnr']:.2f} dB")
+                col_r.info(f"🔴 **RED** |  MSE: {channel_metrics['Red']['mse']:.6f}  |  PSNR: {channel_metrics['Red']['psnr']:.2f} dB")
+                col_g.success(f"🟢 **GREEN**|  MSE: {channel_metrics['Green']['mse']:.6f}  |  PSNR: {channel_metrics['Green']['psnr']:.2f} dB")
+                col_b.info(f"🔵 **BLUE** |  MSE: {channel_metrics['Blue']['mse']:.6f}  |  PSNR: {channel_metrics['Blue']['psnr']:.2f} dB")
 
                 st.markdown("### 🖼️ Steganalysis Visualizer")
                 c1, c2 = st.columns(2)
@@ -903,9 +959,9 @@ elif menu == "Embedding":  # Ubah kondisi if ini saja, sisanya sama persis!
 
 
 # ============================================================================
-# 11. HALAMAN EXTRACTION (Gunakan 'with tab_extract:')
+# 11. HALAMAN EXTRACTION
 # ============================================================================
-elif menu == "Extraction": # Ubah kondisi ini
+elif menu == "Extraction":
     st.title("🔓 Extraction — Ekstrak Pesan Rahasia")
     st.caption("Stego Image → LCG Routing → Modified LSB Reader → AES Decrypt → Plaintext")
     col_upload2, col_form2 = st.columns([1, 1])
@@ -928,14 +984,75 @@ elif menu == "Extraction": # Ubah kondisi ini
                 st.error(str(e))
 
     with col_form2:
-        st.subheader("2️⃣ Password / Kunci")
+        # ==========================================
+        # BLOK UI PENGATURAN KEAMANAN (EXTRACTION)
+        # ==========================================
+        st.subheader("2️⃣ Password & Konfigurasi Pembongkaran")
+        
         password_extract = st.text_input(
             "Masukkan Password yang SAMA dengan saat Embedding",
             type="password",
             key="extract_password",
+            placeholder="Masukkan password..."
         )
+
+        st.write("**Metode Parameter Saat Disisipkan:**")
+        mode_param_ext = st.radio(
+            "Metode Parameter:", 
+            ["🔄 Otomatis (Belakang Layar)", "🔢 Parameter LCG (Auto)", "🛠️ Manual Statis (Pilih Sendiri)"], 
+            horizontal=True,
+            label_visibility="collapsed",
+            key="ext_mode"
+        )
+        
+        manual_channel_ext = "RGB"
+        manual_bit_ext = 1
+        custom_lcg_params_ext = None
+        
+        # JIKA MENGKLIK OPSI 2 (Parameter LCG Auto - Tampilan otomatis terisi dari password)
+        if mode_param_ext == "🔢 Parameter LCG (Auto)":
+            st.markdown("""<div style="background-color: #0c1f3f; padding: 15px; border-radius: 8px; border: 1px dashed #5ad1ff; margin-bottom: 15px;">
+                <b>Parameter LCG Tergenerasi (Auto dari Password)</b><br>
+                <i>Nilai Xn, A, dan C di bawah ini dihitung otomatis secara real-time berdasarkan kunci Anda.</i>
+                """, unsafe_allow_html=True)
+            
+            if password_extract:
+                lcg_chan_demo_ext = derive_lcg_seeds(password_extract, "CHAN", m=7)
+                lcg_bit_demo_ext = derive_lcg_seeds(password_extract, "BIT", m=4)
+                c_x0_ext, c_a_ext, c_c_ext = lcg_chan_demo_ext.state, lcg_chan_demo_ext.a, lcg_chan_demo_ext.c
+                b_x0_ext, b_a_ext, b_c_ext = lcg_bit_demo_ext.state, lcg_bit_demo_ext.a, lcg_bit_demo_ext.c
+            else:
+                c_x0_ext, c_a_ext, c_c_ext = 0, 0, 0
+                b_x0_ext, b_a_ext, b_c_ext = 0, 0, 0
+
+            c1_ext, c2_ext, c3_ext = st.columns(3)
+            with c1_ext:
+                st.number_input("Xn (Channel)", value=int(c_x0_ext), disabled=True, key="ext_auto_cx0")
+                st.number_input("Xn (Bit)", value=int(b_x0_ext), disabled=True, key="ext_auto_bx0")
+            with c2_ext:
+                st.number_input("A (Channel)", value=int(c_a_ext), disabled=True, key="ext_auto_ca")
+                st.number_input("A (Bit)", value=int(b_a_ext), disabled=True, key="ext_auto_ba")
+            with c3_ext:
+                st.number_input("C (Channel)", value=int(c_c_ext), disabled=True, key="ext_auto_cc")
+                st.number_input("C (Bit)", value=int(b_c_ext), disabled=True, key="ext_auto_bc")
+            st.markdown("</div>", unsafe_allow_html=True)
+            
+            custom_lcg_params_ext = {"c_x0": c_x0_ext, "c_a": c_a_ext, "c_c": c_c_ext, "b_x0": b_x0_ext, "b_a": b_a_ext, "b_c": b_c_ext}
+
+        # JIKA MENGKLIK OPSI 3 (Pilih Tombol Manual)
+        elif mode_param_ext == "🛠️ Manual Statis (Pilih Sendiri)":
+            st.markdown("""<div style="background-color: #0c1f3f; padding: 15px; border-radius: 8px; border: 1px dashed #5ad1ff; margin-bottom: 15px;">""", unsafe_allow_html=True)
+            mc1_ext, mc2_ext = st.columns([1.5, 1])
+            with mc1_ext:
+                manual_channel_ext = st.radio("Saluran Warna:", ["R", "G", "B", "RG", "RB", "GB", "RGB"], horizontal=True, key="ext_chan")
+            with mc2_ext:
+                manual_bit_ext = st.radio("Depth:", [1, 2, 3], format_func=lambda x: f"{x} Bit", horizontal=True, key="ext_bit")
+            st.markdown("</div>", unsafe_allow_html=True)
+        # ==========================================
+
         extract_btn = st.button("🔍 Proses Extraction", use_container_width=True)
 
+    # ---- Proses Extraction ----
     if extract_btn:
         if stego_array is None:
             st.error("Silakan unggah stego image yang valid terlebih dahulu.")
@@ -943,28 +1060,43 @@ elif menu == "Extraction": # Ubah kondisi ini
             st.error("Password tidak boleh kosong.")
         else:
             with st.spinner("Membaca header & menelusuri rute LCG yang sama..."):
+                # Konversi pilihan UI ke mode string pendukung fungsi inti
+                if mode_param_ext == "🔄 Otomatis (Belakang Layar)":
+                    extract_mode = "Otomatis"
+                elif mode_param_ext == "🔢 Parameter LCG (Auto)":
+                    extract_mode = "Input LCG"
+                else:
+                    extract_mode = "Manual Statis"
+
                 # Tahap 1: baca 32-bit header (panjang ciphertext dalam bit)
                 header_bits, move_name = extract_message(
-                    stego_array, password_extract, HEADER_BITS
+                    stego_array, password_extract, HEADER_BITS,
+                    mode=extract_mode,
+                    manual_chan=manual_channel_ext,
+                    manual_bit=manual_bit_ext,
+                    custom_lcg=custom_lcg_params_ext
                 )
                 try:
                     cipher_bit_len = int(header_bits, 2)
                 except ValueError:
                     cipher_bit_len = -1
 
-            # Validasi kewajaran panjang header agar tidak crash jika
-            # password salah / gambar bukan stego image yang valid.
+            # Validasi kewajaran panjang header agar tidak crash
             max_possible_bits = stego_array.shape[0] * stego_array.shape[1] * 3 * 3
             if cipher_bit_len <= 0 or cipher_bit_len > max_possible_bits:
                 st.error(
-                    "❌ Ekstraksi GAGAL: Password salah atau gambar bukan hasil "
-                    "Stego Triple-A yang valid (header panjang pesan tidak terbaca)."
+                    "❌ Ekstraksi GAGAL: Password salah, konfigurasi parameter tidak cocok, "
+                    "atau gambar bukan hasil Stego Triple-A yang valid (header panjang pesan tidak terbaca)."
                 )
             else:
                 with st.spinner("Mengekstrak ciphertext & mendekripsi AES-256..."):
                     total_bits_needed = HEADER_BITS + cipher_bit_len
                     full_bits, move_name = extract_message(
-                        stego_array, password_extract, total_bits_needed
+                        stego_array, password_extract, total_bits_needed,
+                        mode=extract_mode,
+                        manual_chan=manual_channel_ext,
+                        manual_bit=manual_bit_ext,
+                        custom_lcg=custom_lcg_params_ext
                     )
                     cipher_bits_only = full_bits[HEADER_BITS:]
                     ciphertext_blob = bits_to_bytes(cipher_bits_only)
@@ -978,33 +1110,33 @@ elif menu == "Extraction": # Ubah kondisi ini
 
                 if not success:
                     st.error(
-                        "❌ Dekripsi AES GAGAL: Password yang dimasukkan kemungkinan "
-                        "salah, atau citra telah mengalami modifikasi/kompresi."
+                        "❌ Dekripsi AES GAGAL: Password yang dimasukkan kemungkinan salah, "
+                        "atau citra telah mengalami modifikasi/kompresi data piksel."
                     )
                 else:
                     st.success("✅ Ekstraksi & dekripsi berhasil!")
                     
-                    # ✨ FITUR BARU EKSTRAKSI 3: Metadata Dashboard
+                    # Fitur Metadata Dashboard
                     st.markdown("### 📊 Extraction Metadata")
                     em1, em2, em3 = st.columns(3)
                     em1.metric("Pola Pergerakan LCG", move_name)
                     em2.metric("Total Bit Diekstrak", f"{len(full_bits)} bit")
                     em3.metric("Ukuran Plaintext", f"{len(plaintext)} karakter")
 
-                    # ✨ FITUR BARU EKSTRAKSI 2: Raw Ciphertext Hex Dump
+                    # Fitur Raw Ciphertext Hex Dump
                     st.markdown("### 💻 Raw Ciphertext (Hex Dump)")
                     st.caption("Data mentah terenkripsi (AES-256) yang diangkat dari LSB sebelum didekripsi.")
-                    # Buat format hex dump sederhana (tampilkan maks 64 byte awal agar rapi)
                     hex_dump = " ".join([f"{b:02X}" for b in ciphertext_blob[:64]])
                     if len(ciphertext_blob) > 64:
                         hex_dump += " ... [TRUNCATED]"
                     st.code(hex_dump, language="text")
 
+                    # Fitur Penampilan Isi Teks Rahasia
                     st.markdown("### 📜 Pesan / Isi Dokumen yang Ditemukan")
                     st.text_area("Plaintext", value=plaintext, height=250)
                     st.metric("Panjang Pesan", f"{len(plaintext)} karakter")
 
-                    # ✨ FITUR BARU EKSTRAKSI 1: Tombol Unduh File .TXT
+                    # Fitur Unduh File .TXT
                     st.download_button(
                         label="📥 Download Pesan (.txt)",
                         data=plaintext,
